@@ -1,0 +1,16 @@
+django>=4.2
+djangorestframework
+djangorestframework-simplejwt
+celery
+redis
+django-celery-results
+openai
+azure-identity
+PyPDF2
+channels
+channels-redis
+faiss-cpu
+sentence-transformers
+azure-cognitiveservices-speech
+django-storages[azure]
+azure-storage-blob
