@@ -24,11 +24,15 @@ def env_int(name: str, default: int | None = None) -> int | None:
     except ValueError:
         return default
 
-SECRET_KEY = 'django-insecure-1@8)v+x#o)#a1-zmffbt%om=l__0#hshwj$y94*@7yq=#r_9vn'
+SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-me')
 
-DEBUG = True
+DEBUG = env_bool('DEBUG', False)
 
-ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv('ALLOWED_HOSTS', '127.0.0.1,localhost').split(',')
+    if host.strip()
+]
 
 
 INSTALLED_APPS = [
