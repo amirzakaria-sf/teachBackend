@@ -24,15 +24,43 @@ def env_int(name: str, default: int | None = None) -> int | None:
     except ValueError:
         return default
 
+
+def env_list(name: str, default: str = '') -> list[str]:
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(',') if item.strip()]
+
+
+def csrf_origins_from_hosts(hosts: list[str]) -> list[str]:
+    origins: list[str] = []
+    ignored_hosts = {'127.0.0.1', 'localhost'}
+    for host in hosts:
+        normalized_host = host.lstrip('.')
+        if not normalized_host or normalized_host == '*' or normalized_host in ignored_hosts:
+            continue
+        origins.append(f'https://{normalized_host}')
+    return origins
+
 SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-me')
 
 DEBUG = env_bool('DEBUG', False)
 
-ALLOWED_HOSTS = [
-    host.strip()
-    for host in os.getenv('ALLOWED_HOSTS', '127.0.0.1,localhost').split(',')
-    if host.strip()
-]
+ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', '127.0.0.1,localhost')
+
+# Production reverse-proxy settings. Host Nginx terminates TLS and forwards
+# X-Forwarded-Proto, so Django must trust that header for secure admin CSRF
+# checks and absolute URL generation.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = env_bool('USE_X_FORWARDED_HOST', True)
+SECURE_SSL_REDIRECT = env_bool('SECURE_SSL_REDIRECT', False)
+
+SESSION_COOKIE_SECURE = env_bool('SESSION_COOKIE_SECURE', not DEBUG)
+CSRF_COOKIE_SECURE = env_bool('CSRF_COOKIE_SECURE', not DEBUG)
+SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax')
+CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax')
+
+CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS') or csrf_origins_from_hosts(
+    ALLOWED_HOSTS
+)
 
 
 INSTALLED_APPS = [
@@ -55,6 +83,7 @@ if USE_AZURE_BLOB_STORAGE:
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -133,7 +162,7 @@ STORAGES = {
         },
     },
     'staticfiles': {
-        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage',
     },
 }
 
