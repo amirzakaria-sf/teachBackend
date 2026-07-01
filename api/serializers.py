@@ -141,9 +141,11 @@ class SubjectSummarySerializer(serializers.ModelSerializer):
 
 
 class UserSummarySerializer(serializers.ModelSerializer):
+    organization_id = serializers.IntegerField(read_only=True)
+
     class Meta:
         model = UserModel
-        fields = ["id", "email", "name", "role"]
+        fields = ["id", "email", "name", "role", "organization_id", "is_active"]
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -178,6 +180,19 @@ class UserCreateUpdateSerializer(UserSerializer):
     def validate(self, attrs):
         role = attrs.get("role", getattr(self.instance, "role", None))
         organization = attrs.get("organization", getattr(self.instance, "organization", None))
+        request = self.context.get("request")
+
+        if self.instance is None and not attrs.get("password"):
+            raise serializers.ValidationError({"password": "Password is required when creating a user directly."})
+
+        if request and request.user.is_authenticated and not request.user.is_superuser:
+            if role == User.Role.ADMIN:
+                raise serializers.ValidationError({"role": "Only a platform super admin can create or update school admin users."})
+            if request.user.organization_id is None:
+                raise serializers.ValidationError({"organization_id": "Your admin account is not assigned to a school."})
+            attrs["organization"] = request.user.organization
+            organization = request.user.organization
+
         if role in {User.Role.PROFESSOR, User.Role.STUDENT} and organization is None:
             raise serializers.ValidationError(
                 {"organization_id": "Professor and student users must belong to an organization."}
@@ -619,9 +634,19 @@ class LoginSerializer(serializers.Serializer):
 
 class WhitelistTeacherSerializer(serializers.Serializer):
     email = serializers.EmailField()
-    organization_id = serializers.IntegerField(min_value=1)
+    organization_id = serializers.IntegerField(min_value=1, required=False)
     grade = serializers.CharField(max_length=50, required=False, allow_blank=True)
     section = serializers.CharField(max_length=50, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated and not request.user.is_superuser:
+            if request.user.organization_id is None:
+                raise serializers.ValidationError({"organization_id": "Your admin account is not assigned to a school."})
+            attrs["organization_id"] = request.user.organization_id
+        elif not attrs.get("organization_id"):
+            raise serializers.ValidationError({"organization_id": "Organization is required."})
+        return attrs
 
 
 class WhitelistStudentSerializer(serializers.Serializer):

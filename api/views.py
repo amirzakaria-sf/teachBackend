@@ -276,14 +276,52 @@ class LogoutView(generics.GenericAPIView):
 class AdminOrganizationListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAdminRole]
     serializer_class = OrganizationSerializer
-    queryset = Organization.objects.all().order_by("name")
+
+    def get_queryset(self):
+        queryset = Organization.objects.all().order_by("name")
+        if self.request.user.is_superuser:
+            return queryset
+        if self.request.user.organization_id:
+            return queryset.filter(pk=self.request.user.organization_id)
+        return Organization.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        if not request.user.is_superuser:
+            return Response(
+                {"detail": "Only the platform super admin can create schools."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().create(request, *args, **kwargs)
 
 
 class AdminOrganizationDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAdminRole]
     serializer_class = OrganizationSerializer
-    queryset = Organization.objects.all()
     lookup_url_kwarg = "org_id"
+
+    def get_queryset(self):
+        queryset = Organization.objects.all()
+        if self.request.user.is_superuser:
+            return queryset
+        if self.request.user.organization_id:
+            return queryset.filter(pk=self.request.user.organization_id)
+        return Organization.objects.none()
+
+    def update(self, request, *args, **kwargs):
+        if not request.user.is_superuser:
+            return Response(
+                {"detail": "Only the platform super admin can update school setup."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if not request.user.is_superuser:
+            return Response(
+                {"detail": "Only the platform super admin can delete schools."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class AdminUserListCreateView(generics.ListCreateAPIView):
@@ -291,13 +329,28 @@ class AdminUserListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         queryset = UserModel.objects.select_related("organization").all()
+        if not self.request.user.is_superuser:
+            if self.request.user.organization_id is None:
+                return UserModel.objects.none()
+            queryset = queryset.filter(organization_id=self.request.user.organization_id, is_superuser=False)
         role = self.request.query_params.get("role")
         org_id = self.request.query_params.get("org_id")
         if role:
             queryset = queryset.filter(role=role)
-        if org_id:
+        if org_id and self.request.user.is_superuser:
             queryset = queryset.filter(organization_id=org_id)
         return queryset.order_by("name", "email")
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+        create_audit_log(
+            action="admin.create_user",
+            actor=self.request.user,
+            organization=user.organization,
+            target_user=user,
+            target_email=user.email,
+            metadata={"role": user.role},
+        )
 
     def get_serializer_class(self):
         if self.request.method == "POST":
@@ -307,8 +360,15 @@ class AdminUserListCreateView(generics.ListCreateAPIView):
 
 class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAdminRole]
-    queryset = UserModel.objects.select_related("organization").all()
     lookup_url_kwarg = "user_id"
+
+    def get_queryset(self):
+        queryset = UserModel.objects.select_related("organization").all()
+        if self.request.user.is_superuser:
+            return queryset
+        if self.request.user.organization_id:
+            return queryset.filter(organization_id=self.request.user.organization_id, is_superuser=False)
+        return UserModel.objects.none()
 
     def get_serializer_class(self):
         if self.request.method in {"PATCH", "PUT"}:
@@ -316,6 +376,8 @@ class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
         return UserSerializer
 
     def perform_destroy(self, instance):
+        if instance.is_superuser:
+            raise drf_serializers.ValidationError({"detail": "Superuser accounts cannot be deactivated from this endpoint."})
         instance.is_active = False
         instance.save(update_fields=["is_active", "updated_at"])
 
@@ -325,23 +387,36 @@ class PlatformAnalyticsView(APIView):
 
     def get(self, request, *args, **kwargs):
         today = timezone.now().date()
+        organization_filter = {}
+        if not request.user.is_superuser:
+            organization_filter = {"organization": request.user.organization}
         data = {
-            "total_organizations": Organization.objects.count(),
-            "total_users": UserModel.objects.count(),
-            "total_classrooms": Classroom.objects.filter(is_active=True).count(),
-            "total_lectures": Lecture.objects.filter(is_active=True).count(),
+            "total_organizations": Organization.objects.count() if request.user.is_superuser else int(bool(request.user.organization_id)),
+            "total_users": UserModel.objects.filter(**organization_filter).count(),
+            "total_classrooms": Classroom.objects.filter(is_active=True, **organization_filter).count(),
+            "total_lectures": Lecture.objects.filter(is_active=True, classroom__organization=request.user.organization).count()
+            if not request.user.is_superuser
+            else Lecture.objects.filter(is_active=True).count(),
             "api_usage": {
-                "translation_calls_today": LectureTranslation.objects.filter(created_at__date=today).count(),
+                "translation_calls_today": LectureTranslation.objects.filter(
+                    created_at__date=today,
+                    lecture__classroom__organization=request.user.organization,
+                ).count()
+                if not request.user.is_superuser
+                else LectureTranslation.objects.filter(created_at__date=today).count(),
                 "document_ai_calls_today": Lecture.objects.filter(
                     created_at__date=today,
+                    **({"classroom__organization": request.user.organization} if not request.user.is_superuser else {}),
                 ).exclude(whiteboard_notes__isnull=True).exclude(whiteboard_notes="").count(),
                 "pipeline_jobs_completed": Lecture.objects.filter(
                     created_at__date=today,
                     processing_status=Lecture.ProcessingStatus.COMPLETED,
+                    **({"classroom__organization": request.user.organization} if not request.user.is_superuser else {}),
                 ).count(),
                 "pipeline_jobs_failed": Lecture.objects.filter(
                     created_at__date=today,
                     processing_status=Lecture.ProcessingStatus.FAILED,
+                    **({"classroom__organization": request.user.organization} if not request.user.is_superuser else {}),
                 ).count(),
             },
         }
@@ -1261,11 +1336,47 @@ class AdminWhitelistTeacherView(generics.GenericAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         from api.models import WhitelistedEmail
+        email = UserModel.objects.normalize_email(serializer.validated_data["email"])
+        organization_id = serializer.validated_data["organization_id"]
+
+        existing_teacher = UserModel.objects.filter(
+            email=email,
+            organization_id=organization_id,
+            role=User.Role.PROFESSOR,
+            is_active=True,
+        ).first()
+        if existing_teacher:
+            return Response(
+                {
+                    "email": email,
+                    "status": "already_exists",
+                    "user_id": existing_teacher.id,
+                    "message": "This teacher already has an active account for this school.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        existing_invite = WhitelistedEmail.objects.filter(
+            email=email,
+            organization_id=organization_id,
+        ).first()
+        if existing_invite:
+            return Response(
+                {
+                    "id": existing_invite.id,
+                    "email": existing_invite.email,
+                    "role": existing_invite.role,
+                    "status": "already_used" if existing_invite.is_used else "already_whitelisted",
+                    "message": "This teacher email is already present in the onboarding list for this school.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
         entry = WhitelistedEmail.objects.create(
-            email=serializer.validated_data["email"],
+            email=email,
             role=WhitelistedEmail.InviteRole.TEACHER,
             created_by=request.user,
-            organization_id=serializer.validated_data["organization_id"],
+            organization_id=organization_id,
             grade=serializer.validated_data.get("grade"),
             section=serializer.validated_data.get("section"),
         )
