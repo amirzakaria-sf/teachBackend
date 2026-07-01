@@ -201,6 +201,8 @@ class UserCreateUpdateSerializer(UserSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop("password")
+        if validated_data.get("role") == User.Role.ADMIN:
+            validated_data["is_profile_complete"] = True
         return UserModel.objects.create_user(password=password, **validated_data)
 
     def update(self, instance, validated_data):
@@ -253,8 +255,38 @@ class ClassroomWriteSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Classroom
-        fields = ["id", "name", "grade", "section", "subject_id", "is_active"]
+        fields = ["id", "name", "subject_id", "is_active"]
         read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        teacher = getattr(request, "user", None)
+        subject = attrs.get("subject", getattr(self.instance, "subject", None))
+        if teacher and teacher.is_authenticated:
+            profile = getattr(teacher, "profile", None)
+            if profile is None or not profile.section:
+                raise serializers.ValidationError(
+                    {"section": "Your section is managed by the school admin. Ask the school admin to assign your class/section before creating classrooms."}
+                )
+            if subject and teacher.organization:
+                if not teacher.organization.boards.filter(pk=subject.board_id).exists():
+                    raise serializers.ValidationError({"subject_id": "This subject board is not enabled for your school."})
+                if not teacher.organization.grades.filter(pk=subject.grade_id).exists():
+                    raise serializers.ValidationError({"subject_id": "This subject grade is not enabled for your school."})
+        return attrs
+
+    def create(self, validated_data):
+        teacher = self.context["request"].user
+        profile = teacher.profile
+        subject = validated_data["subject"]
+        validated_data["grade"] = subject.grade.name
+        validated_data["section"] = profile.section
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if "subject" in validated_data:
+            instance.grade = validated_data["subject"].grade.name
+        return super().update(instance, validated_data)
 
 
 class LectureTranslationSerializer(serializers.ModelSerializer):
@@ -567,19 +599,24 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
+        is_profile_complete = True if user.role == User.Role.ADMIN else user.is_profile_complete
         token["email"] = user.email
         token["name"] = user.name
         token["role"] = user.role
         token["organization_id"] = user.organization_id
-        token["is_profile_complete"] = user.is_profile_complete
+        token["is_superuser"] = user.is_superuser
+        token["is_profile_complete"] = is_profile_complete
         return token
 
     def validate(self, attrs):
         data = super().validate(attrs)
+        if self.user.role == User.Role.ADMIN and not self.user.is_profile_complete:
+            self.user.is_profile_complete = True
+            self.user.save(update_fields=["is_profile_complete", "updated_at"])
         data["access_token"] = data.pop("access")
         data["refresh_token"] = data.pop("refresh")
         data["user"] = UserSerializer(self.user).data
-        data["is_profile_complete"] = self.user.is_profile_complete
+        data["is_profile_complete"] = True if self.user.role == User.Role.ADMIN else self.user.is_profile_complete
         return data
 
 
@@ -712,6 +749,17 @@ class UserProfileSerializer(serializers.ModelSerializer):
         elif user.role == "professor" and user.is_profile_complete:
             self.fields["grade"].read_only = True
             self.fields["section"].read_only = True
+
+    def validate(self, attrs):
+        user = getattr(getattr(self, "instance", None), "user", None)
+        initial_data = getattr(self, "initial_data", {}) or {}
+        if user and user.role in {User.Role.ADMIN, User.Role.PROFESSOR, User.Role.STUDENT}:
+            forbidden_fields = {"grade", "section", "mapped_teacher"} & set(initial_data.keys())
+            if forbidden_fields:
+                raise serializers.ValidationError(
+                    {field: "This field is managed by the school admin/onboarding flow." for field in forbidden_fields}
+                )
+        return attrs
 
 
 # ── Classroom orchestration serializers ──

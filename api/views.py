@@ -1609,7 +1609,11 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
     def perform_update(self, serializer):
         serializer.save()
         user = self.request.user
-        if not user.is_profile_complete:
+        if user.role == User.Role.ADMIN and not user.is_profile_complete:
+            user.is_profile_complete = True
+            user.save(update_fields=["is_profile_complete", "updated_at"])
+            return
+        if user.role in {User.Role.PROFESSOR, User.Role.STUDENT} and not user.is_profile_complete:
             user.is_profile_complete = True
             user.save(update_fields=["is_profile_complete", "updated_at"])
 
