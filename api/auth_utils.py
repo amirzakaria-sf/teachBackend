@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
@@ -14,6 +16,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 
 UserModel = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 def effective_profile_complete(user) -> bool:
@@ -37,41 +40,81 @@ def issue_token_pair_for_user(user) -> tuple[str, str]:
 
 
 def set_auth_cookies(response: Response, *, access_token: str, refresh_token: str | None = None) -> None:
+    samesite = str(getattr(settings, "AUTH_COOKIE_SAMESITE", "Lax") or "Lax").strip().lower()
+    normalized_samesite = {"lax": "Lax", "strict": "Strict", "none": "None"}.get(samesite, "Lax")
+    if samesite not in {"lax", "strict", "none"}:
+        logger.warning("Invalid AUTH_COOKIE_SAMESITE=%r; falling back to 'Lax'.", settings.AUTH_COOKIE_SAMESITE)
+
+    cookie_path = str(getattr(settings, "AUTH_COOKIE_PATH", "/") or "/").strip() or "/"
+    cookie_domain = getattr(settings, "AUTH_COOKIE_DOMAIN", None)
+
+    access_max_age = int(settings.SIMPLE_JWT["ACCESS_TOKEN_LIFETIME"].total_seconds())
+    refresh_max_age = int(settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
+
+    try:
+        response.set_cookie(
+            settings.AUTH_ACCESS_COOKIE_NAME,
+            access_token,
+            max_age=access_max_age,
+            httponly=True,
+            secure=settings.AUTH_COOKIE_SECURE,
+            samesite=normalized_samesite,
+            path=cookie_path,
+            domain=cookie_domain,
+        )
+        if refresh_token is not None:
+            response.set_cookie(
+                settings.AUTH_REFRESH_COOKIE_NAME,
+                refresh_token,
+                max_age=refresh_max_age,
+                httponly=True,
+                secure=settings.AUTH_COOKIE_SECURE,
+                samesite=normalized_samesite,
+                path=cookie_path,
+                domain=cookie_domain,
+            )
+        return
+    except Exception:
+        logger.exception("Failed to set auth cookies with configured attributes; retrying with safe defaults.")
+
     response.set_cookie(
         settings.AUTH_ACCESS_COOKIE_NAME,
         access_token,
-        max_age=int(settings.SIMPLE_JWT["ACCESS_TOKEN_LIFETIME"].total_seconds()),
+        max_age=access_max_age,
         httponly=True,
         secure=settings.AUTH_COOKIE_SECURE,
-        samesite=settings.AUTH_COOKIE_SAMESITE,
-        path=settings.AUTH_COOKIE_PATH,
-        domain=settings.AUTH_COOKIE_DOMAIN,
+        samesite="Lax",
+        path="/",
     )
     if refresh_token is not None:
         response.set_cookie(
             settings.AUTH_REFRESH_COOKIE_NAME,
             refresh_token,
-            max_age=int(settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds()),
+            max_age=refresh_max_age,
             httponly=True,
             secure=settings.AUTH_COOKIE_SECURE,
-            samesite=settings.AUTH_COOKIE_SAMESITE,
-            path=settings.AUTH_COOKIE_PATH,
-            domain=settings.AUTH_COOKIE_DOMAIN,
+            samesite="Lax",
+            path="/",
         )
 
 
 def clear_auth_cookies(response: Response) -> None:
+    samesite = str(getattr(settings, "AUTH_COOKIE_SAMESITE", "Lax") or "Lax").strip().lower()
+    normalized_samesite = {"lax": "Lax", "strict": "Strict", "none": "None"}.get(samesite, "Lax")
+    cookie_path = str(getattr(settings, "AUTH_COOKIE_PATH", "/") or "/").strip() or "/"
+    cookie_domain = getattr(settings, "AUTH_COOKIE_DOMAIN", None)
+
     response.delete_cookie(
         settings.AUTH_ACCESS_COOKIE_NAME,
-        path=settings.AUTH_COOKIE_PATH,
-        domain=settings.AUTH_COOKIE_DOMAIN,
-        samesite=settings.AUTH_COOKIE_SAMESITE,
+        path=cookie_path,
+        domain=cookie_domain,
+        samesite=normalized_samesite,
     )
     response.delete_cookie(
         settings.AUTH_REFRESH_COOKIE_NAME,
-        path=settings.AUTH_COOKIE_PATH,
-        domain=settings.AUTH_COOKIE_DOMAIN,
-        samesite=settings.AUTH_COOKIE_SAMESITE,
+        path=cookie_path,
+        domain=cookie_domain,
+        samesite=normalized_samesite,
     )
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from rest_framework import serializers
@@ -33,6 +35,7 @@ from api.models import (
 
 
 UserModel = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class OrganizationSerializer(serializers.ModelSerializer):
@@ -767,7 +770,25 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             self.user.save(update_fields=["is_profile_complete", "updated_at"])
         data["access_token"] = data.pop("access")
         data["refresh_token"] = data.pop("refresh")
-        data["user"] = UserSerializer(self.user).data
+        try:
+            data["user"] = UserSerializer(self.user).data
+        except Exception:
+            logger.exception("Failed to serialize authenticated user payload for user_id=%s", getattr(self.user, "id", None))
+            data["user"] = {
+                "id": self.user.id,
+                "email": self.user.email,
+                "name": self.user.name,
+                "role": self.user.role,
+                "organization_id": self.user.organization_id,
+                "grade": None,
+                "section": None,
+                "student_identifier": None,
+                "mapped_teacher_id": None,
+                "mapped_teacher_name": None,
+                "is_active": self.user.is_active,
+                "created_at": self.user.created_at,
+                "updated_at": self.user.updated_at,
+            }
         data["is_profile_complete"] = True if self.user.role == User.Role.ADMIN else self.user.is_profile_complete
         return data
 

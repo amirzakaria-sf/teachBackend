@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 from django.contrib.auth import get_user_model
@@ -103,6 +104,7 @@ from api.throttles import LoginEmailRateThrottle, LoginIPRateThrottle
 
 
 UserModel = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 def create_audit_log(
@@ -425,19 +427,23 @@ class CustomTokenObtainPairView(generics.GenericAPIView):
     throttle_classes = [LoginIPRateThrottle, LoginEmailRateThrottle]
 
     def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        response_payload = {
-            "user": serializer.validated_data["user"],
-            "is_profile_complete": serializer.validated_data["is_profile_complete"],
-        }
-        response = Response(response_payload, status=status.HTTP_200_OK)
-        set_auth_cookies(
-            response,
-            access_token=serializer.validated_data["access_token"],
-            refresh_token=serializer.validated_data["refresh_token"],
-        )
-        return response
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            response_payload = {
+                "user": serializer.validated_data["user"],
+                "is_profile_complete": serializer.validated_data["is_profile_complete"],
+            }
+            response = Response(response_payload, status=status.HTTP_200_OK)
+            set_auth_cookies(
+                response,
+                access_token=serializer.validated_data["access_token"],
+                refresh_token=serializer.validated_data["refresh_token"],
+            )
+            return response
+        except Exception:
+            logger.exception("Auth login request crashed for email=%r", request.data.get("email"))
+            raise
 
 
 class CookieTokenRefreshView(generics.GenericAPIView):
