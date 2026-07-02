@@ -187,11 +187,11 @@ class UserSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
-    grade = serializers.CharField(source="profile.grade", read_only=True, allow_null=True)
-    section = serializers.CharField(source="profile.section", read_only=True, allow_null=True)
-    student_identifier = serializers.CharField(source="profile.student_identifier", read_only=True, allow_null=True)
-    mapped_teacher_id = serializers.IntegerField(source="profile.mapped_teacher_id", read_only=True, allow_null=True)
-    mapped_teacher_name = serializers.CharField(source="profile.mapped_teacher.name", read_only=True, allow_null=True)
+    grade = serializers.SerializerMethodField()
+    section = serializers.SerializerMethodField()
+    student_identifier = serializers.SerializerMethodField()
+    mapped_teacher_id = serializers.SerializerMethodField()
+    mapped_teacher_name = serializers.SerializerMethodField()
 
     class Meta:
         model = UserModel
@@ -211,6 +211,32 @@ class UserSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def _profile(self, obj):
+        try:
+            return obj.profile
+        except UserProfile.DoesNotExist:
+            return None
+
+    def get_grade(self, obj):
+        profile = self._profile(obj)
+        return profile.grade if profile else None
+
+    def get_section(self, obj):
+        profile = self._profile(obj)
+        return profile.section if profile else None
+
+    def get_student_identifier(self, obj):
+        profile = self._profile(obj)
+        return profile.student_identifier if profile else None
+
+    def get_mapped_teacher_id(self, obj):
+        profile = self._profile(obj)
+        return profile.mapped_teacher_id if profile else None
+
+    def get_mapped_teacher_name(self, obj):
+        profile = self._profile(obj)
+        return profile.mapped_teacher.name if profile and profile.mapped_teacher else None
 
 
 class UserCreateUpdateSerializer(UserSerializer):
