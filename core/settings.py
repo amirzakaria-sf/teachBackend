@@ -4,6 +4,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -40,9 +42,21 @@ def csrf_origins_from_hosts(hosts: list[str]) -> list[str]:
         origins.append(f'https://{normalized_host}')
     return origins
 
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-me')
-
 DEBUG = env_bool('DEBUG', False)
+
+SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'dev-only-insecure-secret'
+    else:
+        raise ImproperlyConfigured('SECRET_KEY environment variable must be set when DEBUG is false.')
+
+JWT_SIGNING_KEY = os.getenv('JWT_SIGNING_KEY', '').strip()
+if not JWT_SIGNING_KEY:
+    if DEBUG:
+        JWT_SIGNING_KEY = SECRET_KEY
+    else:
+        raise ImproperlyConfigured('JWT_SIGNING_KEY environment variable must be set when DEBUG is false.')
 
 ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', '127.0.0.1,localhost')
 
@@ -57,6 +71,14 @@ SESSION_COOKIE_SECURE = env_bool('SESSION_COOKIE_SECURE', not DEBUG)
 CSRF_COOKIE_SECURE = env_bool('CSRF_COOKIE_SECURE', not DEBUG)
 SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax')
 CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax')
+
+AUTH_ACCESS_COOKIE_NAME = os.getenv('AUTH_ACCESS_COOKIE_NAME', 'access_token')
+AUTH_REFRESH_COOKIE_NAME = os.getenv('AUTH_REFRESH_COOKIE_NAME', 'refresh_token')
+AUTH_COOKIE_DOMAIN = os.getenv('AUTH_COOKIE_DOMAIN', '').strip() or None
+AUTH_COOKIE_PATH = os.getenv('AUTH_COOKIE_PATH', '/')
+AUTH_COOKIE_SECURE = env_bool('AUTH_COOKIE_SECURE', not DEBUG)
+AUTH_COOKIE_SAMESITE = os.getenv('AUTH_COOKIE_SAMESITE', 'Lax')
+OTP_MAX_ATTEMPTS = env_int('OTP_MAX_ATTEMPTS', 5) or 5
 
 CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS') or csrf_origins_from_hosts(
     ALLOWED_HOSTS
@@ -215,11 +237,23 @@ AUTH_USER_MODEL = 'api.User'
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'api.authentication.CookieJWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_RATES': {
+        'login_ip': '10/min',
+        'login_email': '5/10min',
+        'otp_request_ip': '10/min',
+        'otp_request_email': '5/10min',
+        'otp_verify_ip': '20/10min',
+        'otp_verify_email': '5/10min',
+        'password_reset_request_ip': '10/min',
+        'password_reset_request_email': '5/10min',
+        'password_reset_confirm_ip': '10/min',
+        'password_reset_confirm_email': '5/10min',
+    },
 }
 
 SIMPLE_JWT = {
@@ -229,7 +263,7 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': True,
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': SECRET_KEY,
+    'SIGNING_KEY': JWT_SIGNING_KEY,
     'AUTH_HEADER_TYPES': ('Bearer',),
     'USER_ID_FIELD': 'id',
     'USER_ID_CLAIM': 'user_id',

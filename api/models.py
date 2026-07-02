@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from datetime import timedelta
 from uuid import uuid4
 
@@ -9,7 +10,7 @@ from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
-from django.utils.crypto import get_random_string
+from django.utils.crypto import get_random_string, salted_hmac
 from django.utils.text import slugify
 
 
@@ -175,9 +176,15 @@ class UserManager(BaseUserManager):
         extra_fields.setdefault("is_superuser", False)
         role = extra_fields.get("role")
         organization = extra_fields.get("organization")
+        is_superuser = extra_fields.get("is_superuser", False)
 
-        if role in {User.Role.PROFESSOR, User.Role.STUDENT} and organization is None:
-            raise ValueError("Professor and student accounts must belong to an organization.")
+        if is_superuser:
+            if role and role != User.Role.ADMIN:
+                raise ValueError("Platform super admins must use the admin role.")
+            if organization is not None:
+                raise ValueError("Platform super admins cannot be assigned to an organization.")
+        if role in {User.Role.ADMIN, User.Role.PROFESSOR, User.Role.STUDENT} and not is_superuser and organization is None:
+            raise ValueError("School admin, professor, and student accounts must belong to an organization.")
 
         return self._create_user(email, password, **extra_fields)
 
@@ -231,8 +238,12 @@ class User(AbstractUser, TimeStampedModel):
 
     def clean(self):
         super().clean()
-        if self.role in {self.Role.PROFESSOR, self.Role.STUDENT} and not self.organization_id:
-            raise ValidationError({"organization": "Professor and student accounts require an organization."})
+        if self.is_superuser and self.role != self.Role.ADMIN:
+            raise ValidationError({"role": "Platform super admins must use the admin role."})
+        if self.is_superuser and self.organization_id is not None:
+            raise ValidationError({"organization": "Platform super admins cannot be assigned to a school."})
+        if self.role in {self.Role.ADMIN, self.Role.PROFESSOR, self.Role.STUDENT} and not self.is_superuser and not self.organization_id:
+            raise ValidationError({"organization": "School admin, professor, and student accounts require an organization."})
 
     def save(self, *args, **kwargs):
         self.email = self.__class__.objects.normalize_email(self.email)
@@ -284,9 +295,10 @@ class OTPVerification(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
     email = models.EmailField()
-    otp_code = models.CharField(max_length=6)
+    otp_code = models.CharField(max_length=128)
     purpose = models.CharField(max_length=10, choices=Purpose.choices)
     is_used = models.BooleanField(default=False)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
     expires_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -302,15 +314,36 @@ class OTPVerification(models.Model):
         super().save(*args, **kwargs)
 
     @classmethod
+    def digest_code(cls, *, email: str, purpose: str, otp_code: str) -> str:
+        normalized_email = str(email or "").strip().lower()
+        payload = f"{normalized_email}:{purpose}:{otp_code}"
+        return salted_hmac("otp-verification", payload, secret=settings.SECRET_KEY).hexdigest()
+
+    @classmethod
     def generate(cls, email: str, purpose: str):
-        import random
         cls.objects.filter(email=email, purpose=purpose, is_used=False).update(is_used=True)
         fixed_otp = str(getattr(settings, "FIXED_TEST_OTP", "") or "").strip()
         if getattr(settings, "DEBUG", False) and len(fixed_otp) == 6 and fixed_otp.isdigit():
             otp = fixed_otp
         else:
-            otp = str(random.randint(100000, 999999))
-        return cls.objects.create(email=email, otp_code=otp, purpose=purpose)
+            otp = f"{secrets.randbelow(1_000_000):06d}"
+        digest = cls.digest_code(email=email, purpose=purpose, otp_code=otp)
+        return cls.objects.create(email=email, otp_code=digest, purpose=purpose), otp
+
+    def matches_code(self, raw_code: str) -> bool:
+        candidate = str(raw_code or "").strip()
+        if len(self.otp_code) == 6 and self.otp_code.isdigit():
+            return secrets.compare_digest(self.otp_code, candidate)
+        expected_digest = self.digest_code(email=self.email, purpose=self.purpose, otp_code=candidate)
+        return secrets.compare_digest(self.otp_code, expected_digest)
+
+    def register_failure(self) -> None:
+        self.attempt_count = (self.attempt_count or 0) + 1
+        update_fields = ["attempt_count"]
+        if self.attempt_count >= getattr(settings, "OTP_MAX_ATTEMPTS", 5):
+            self.is_used = True
+            update_fields.append("is_used")
+        self.save(update_fields=update_fields)
 
     @property
     def is_expired(self) -> bool:
@@ -326,11 +359,12 @@ class OTPVerification(models.Model):
 
 class WhitelistedEmail(models.Model):
     class InviteRole(models.TextChoices):
+        SCHOOL_ADMIN = "school_admin", "School Admin"
         TEACHER = "teacher", "Teacher"
         STUDENT = "student", "Student"
 
     email = models.EmailField()
-    role = models.CharField(max_length=10, choices=InviteRole.choices)
+    role = models.CharField(max_length=20, choices=InviteRole.choices)
     created_by = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="whitelisted_emails",
     )
@@ -348,9 +382,16 @@ class WhitelistedEmail(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
-        unique_together = [["email", "organization"]]
         indexes = [
+            models.Index(fields=["email", "organization"]),
             models.Index(fields=["organization", "is_used"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["email", "organization"],
+                condition=models.Q(is_used=False),
+                name="uniq_pending_whitelist_email_org",
+            )
         ]
 
     def clean(self):
@@ -361,6 +402,29 @@ class WhitelistedEmail(models.Model):
             )
             if pending.exists():
                 raise ValidationError({"email": "This email already has a pending invitation in this organization."})
+
+    @classmethod
+    def map_invite_role_to_user_role(cls, invite_role: str) -> str:
+        role = (invite_role or "").strip().lower()
+        if role == cls.InviteRole.SCHOOL_ADMIN:
+            return User.Role.ADMIN
+        if role == cls.InviteRole.TEACHER:
+            return User.Role.PROFESSOR
+        if role == cls.InviteRole.STUDENT:
+            return User.Role.STUDENT
+        raise ValidationError({"role": "Unsupported whitelist role."})
+
+    @property
+    def mapped_user_role(self) -> str:
+        return self.map_invite_role_to_user_role(self.role)
+
+    @property
+    def mapped_is_profile_complete(self) -> bool:
+        return self.role == self.InviteRole.SCHOOL_ADMIN
+
+    def save(self, *args, **kwargs):
+        self.email = User.objects.normalize_email(self.email)
+        super().save(*args, **kwargs)
 
     def consume(self, user: User):
         self.is_used = True
@@ -469,6 +533,11 @@ class Classroom(ActiveModel):
             raise ValidationError({"professor": "Classroom professor must have the professor role."})
         if self.professor.organization_id != self.organization_id:
             raise ValidationError({"organization": "Professor and classroom must belong to the same organization."})
+        if self.class_teacher_id:
+            if self.class_teacher.role != User.Role.PROFESSOR:
+                raise ValidationError({"class_teacher": "Class teacher must have the professor role."})
+            if self.class_teacher.organization_id != self.organization_id:
+                raise ValidationError({"class_teacher": "Class teacher and classroom must belong to the same organization."})
         if self.subject_id:
             if not self.organization.boards.filter(pk=self.subject.board_id).exists():
                 raise ValidationError({"subject": "Subject board is not enabled for this organization."})
@@ -541,11 +610,19 @@ class ClassroomSubjectTeacher(models.Model):
 
     def clean(self):
         super().clean()
+        if self.teacher.role != User.Role.PROFESSOR:
+            raise ValidationError({"teacher": "Only professors can be assigned as subject teachers."})
         if self.teacher.organization_id != self.classroom.organization_id:
             raise ValidationError({"teacher": "Subject teacher must belong to the same organization as the classroom."})
         subject_org = self.classroom.organization
         if not subject_org.boards.filter(pk=self.subject.board_id).exists():
             raise ValidationError({"subject": "Subject board must be enabled for this organization."})
+        if not subject_org.grades.filter(pk=self.subject.grade_id).exists():
+            raise ValidationError({"subject": "Subject grade must be enabled for this organization."})
+        if self.subject.board_id != self.classroom.subject.board_id:
+            raise ValidationError({"subject": "Subject teacher assignments must stay within the classroom board."})
+        if self.subject.grade_id != self.classroom.subject.grade_id:
+            raise ValidationError({"subject": "Subject teacher assignments must stay within the classroom grade."})
 
     def __str__(self):
         return f"{self.teacher.name} teaches {self.subject.name} in {self.classroom.name}"

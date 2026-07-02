@@ -5,6 +5,7 @@ from django.db import transaction
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
+from api.auth_utils import validate_password_or_raise
 from api.models import (
     AuditLog,
     Board,
@@ -27,6 +28,7 @@ from api.models import (
     StudentQuizAttempt,
     Summary,
     User,
+    UserProfile,
 )
 
 
@@ -130,6 +132,36 @@ class SyllabusDocumentSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def validate(self, attrs):
+        request = self.context.get("request")
+        organization = attrs.get("organization", getattr(self.instance, "organization", None))
+        subject = attrs.get("subject", getattr(self.instance, "subject", None))
+
+        if request and request.user.is_authenticated:
+            if request.user.is_superuser:
+                if organization is None:
+                    raise serializers.ValidationError({"organization": "Organization is required to upload syllabus files."})
+            else:
+                if request.user.organization_id is None:
+                    raise serializers.ValidationError({"organization": "Your admin account is not assigned to a school."})
+                requested_organization = attrs.get("organization")
+                if requested_organization and requested_organization != request.user.organization:
+                    raise serializers.ValidationError(
+                        {"organization": "School admins can only manage syllabus documents for their own school."}
+                    )
+                attrs["organization"] = request.user.organization
+                organization = request.user.organization
+
+        if organization is None:
+            raise serializers.ValidationError({"organization": "Organization is required to upload syllabus files."})
+
+        if subject:
+            if not organization.boards.filter(pk=subject.board_id).exists():
+                raise serializers.ValidationError({"subject": "Subject board is not enabled for this organization."})
+            if not organization.grades.filter(pk=subject.grade_id).exists():
+                raise serializers.ValidationError({"subject": "Subject grade is not enabled for this organization."})
+        return attrs
+
 
 class SubjectSummarySerializer(serializers.ModelSerializer):
     board = serializers.CharField(source="board.name", read_only=True)
@@ -155,6 +187,11 @@ class UserSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+    grade = serializers.CharField(source="profile.grade", read_only=True, allow_null=True)
+    section = serializers.CharField(source="profile.section", read_only=True, allow_null=True)
+    student_identifier = serializers.CharField(source="profile.student_identifier", read_only=True, allow_null=True)
+    mapped_teacher_id = serializers.IntegerField(source="profile.mapped_teacher_id", read_only=True, allow_null=True)
+    mapped_teacher_name = serializers.CharField(source="profile.mapped_teacher.name", read_only=True, allow_null=True)
 
     class Meta:
         model = UserModel
@@ -164,6 +201,11 @@ class UserSerializer(serializers.ModelSerializer):
             "name",
             "role",
             "organization_id",
+            "grade",
+            "section",
+            "student_identifier",
+            "mapped_teacher_id",
+            "mapped_teacher_name",
             "is_active",
             "created_at",
             "updated_at",
@@ -173,45 +215,129 @@ class UserSerializer(serializers.ModelSerializer):
 
 class UserCreateUpdateSerializer(UserSerializer):
     password = serializers.CharField(write_only=True, required=False, min_length=8)
+    grade = serializers.CharField(source="profile.grade", required=False, allow_blank=True, allow_null=True)
+    section = serializers.CharField(source="profile.section", required=False, allow_blank=True, allow_null=True)
+    mapped_teacher_id = serializers.PrimaryKeyRelatedField(
+        source="profile.mapped_teacher",
+        queryset=UserModel.objects.filter(role=User.Role.PROFESSOR, is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    mapped_teacher_name = serializers.CharField(source="profile.mapped_teacher.name", read_only=True, allow_null=True)
 
     class Meta(UserSerializer.Meta):
         fields = UserSerializer.Meta.fields + ["password"]
 
     def validate(self, attrs):
+        initial_data = getattr(self, "initial_data", {}) or {}
+        profile_data = attrs.get("profile", {})
+        incoming_role = attrs.get("role")
+        incoming_organization = attrs.get("organization") if "organization" in attrs else serializers.empty
+        mapped_teacher = profile_data.get("mapped_teacher", serializers.empty)
         role = attrs.get("role", getattr(self.instance, "role", None))
         organization = attrs.get("organization", getattr(self.instance, "organization", None))
+        target_is_superuser = getattr(self.instance, "is_superuser", False)
         request = self.context.get("request")
 
-        if self.instance is None and not attrs.get("password"):
-            raise serializers.ValidationError({"password": "Password is required when creating a user directly."})
+        if self.instance is None:
+            raise serializers.ValidationError({"detail": "Direct user creation is disabled. Use the whitelist invite flow instead."})
+
+        if "password" in initial_data:
+            raise serializers.ValidationError({
+                "password": "Direct password changes are disabled. Use the password reset flow instead.",
+            })
+
+        if self.instance is not None:
+            if incoming_role is not None and incoming_role != self.instance.role:
+                raise serializers.ValidationError(
+                    {"role": "Changing a user's role via this endpoint is not supported. Create or whitelist a new user instead."}
+                )
+            if incoming_organization is not serializers.empty and incoming_organization != self.instance.organization:
+                raise serializers.ValidationError(
+                    {"organization_id": "Changing a user's organization via this endpoint is not supported."}
+                )
 
         if request and request.user.is_authenticated and not request.user.is_superuser:
             if role == User.Role.ADMIN:
                 raise serializers.ValidationError({"role": "Only a platform super admin can create or update school admin users."})
             if request.user.organization_id is None:
                 raise serializers.ValidationError({"organization_id": "Your admin account is not assigned to a school."})
+            if incoming_organization is not serializers.empty and incoming_organization != request.user.organization:
+                raise serializers.ValidationError({"organization_id": "School admins can only manage users inside their own school."})
             attrs["organization"] = request.user.organization
             organization = request.user.organization
 
-        if role in {User.Role.PROFESSOR, User.Role.STUDENT} and organization is None:
+        if target_is_superuser:
+            if role != User.Role.ADMIN:
+                raise serializers.ValidationError({"role": "Platform super admins must keep the admin role."})
+            if organization is not None:
+                raise serializers.ValidationError({"organization_id": "Platform super admins cannot be assigned to a school."})
+
+        if role == User.Role.ADMIN and any(
+            value not in {None, ""}
+            for value in [profile_data.get("grade"), profile_data.get("section")]
+        ):
+            raise serializers.ValidationError({"grade": "Admin users do not support grade/section assignments."})
+        if role != User.Role.STUDENT and mapped_teacher not in (serializers.empty, None):
+            raise serializers.ValidationError({"mapped_teacher_id": "Only student users can be mapped to a teacher."})
+        if role == User.Role.ADMIN and mapped_teacher not in (serializers.empty, None):
+            raise serializers.ValidationError({"mapped_teacher_id": "Admin users cannot be mapped to a teacher."})
+
+        if role in {User.Role.ADMIN, User.Role.PROFESSOR, User.Role.STUDENT} and not target_is_superuser and organization is None:
             raise serializers.ValidationError(
-                {"organization_id": "Professor and student users must belong to an organization."}
+                {"organization_id": "School admin, professor, and student users must belong to an organization."}
             )
+
+        if mapped_teacher not in (serializers.empty, None):
+            if organization is None or mapped_teacher.organization_id != organization.id:
+                raise serializers.ValidationError({"mapped_teacher_id": "Mapped teacher must belong to the same organization."})
         return attrs
 
+    def _save_profile(self, user, profile_data):
+        if not profile_data and user.role not in {User.Role.PROFESSOR, User.Role.STUDENT}:
+            return
+
+        profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"full_name": user.name or ""},
+        )
+        update_fields = []
+
+        if not profile.full_name and user.name:
+            profile.full_name = user.name
+            update_fields.append("full_name")
+
+        for field in ("grade", "section"):
+            if field in profile_data:
+                setattr(profile, field, profile_data[field])
+                update_fields.append(field)
+
+        if user.role == User.Role.STUDENT:
+            if "mapped_teacher" in profile_data:
+                profile.mapped_teacher = profile_data.get("mapped_teacher")
+                update_fields.append("mapped_teacher")
+            elif profile.mapped_teacher_id and profile.mapped_teacher.organization_id != user.organization_id:
+                profile.mapped_teacher = None
+                update_fields.append("mapped_teacher")
+            if user.organization_id and not profile.student_identifier:
+                profile.student_identifier = UserProfile.generate_student_id(user.organization_id)
+                update_fields.append("student_identifier")
+        elif profile.mapped_teacher_id is not None:
+            profile.mapped_teacher = None
+            update_fields.append("mapped_teacher")
+
+        if update_fields:
+            profile.save(update_fields=list(dict.fromkeys(update_fields)))
+
     def create(self, validated_data):
-        password = validated_data.pop("password")
-        if validated_data.get("role") == User.Role.ADMIN:
-            validated_data["is_profile_complete"] = True
-        return UserModel.objects.create_user(password=password, **validated_data)
+        raise serializers.ValidationError({"detail": "Direct user creation is disabled. Use the whitelist invite flow instead."})
 
     def update(self, instance, validated_data):
-        password = validated_data.pop("password", None)
+        profile_data = validated_data.pop("profile", {})
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
-        if password:
-            instance.set_password(password)
         instance.save()
+        self._save_profile(instance, profile_data)
         return instance
 
 
@@ -590,7 +716,7 @@ class LectureChatSerializer(serializers.Serializer):
 
 
 class LogoutSerializer(serializers.Serializer):
-    refresh_token = serializers.CharField()
+    refresh_token = serializers.CharField(required=False, allow_blank=True)
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -630,6 +756,7 @@ class RequestOtpSerializer(serializers.Serializer):
 class VerifyOtpSerializer(serializers.Serializer):
     email = serializers.EmailField()
     otp_code = serializers.CharField(min_length=6, max_length=6)
+    organization_slug = serializers.CharField(max_length=255, required=False)
 
 
 class SetPasswordSerializer(serializers.Serializer):
@@ -639,6 +766,7 @@ class SetPasswordSerializer(serializers.Serializer):
     def validate(self, attrs):
         if attrs["password"] != attrs["confirm_password"]:
             raise serializers.ValidationError({"confirm_password": "Passwords do not match."})
+        validate_password_or_raise(attrs["password"], field_name="password")
         return attrs
 
 
@@ -651,9 +779,14 @@ class ResetPasswordSerializer(serializers.Serializer):
     otp_code = serializers.CharField(min_length=6, max_length=6)
     new_password = serializers.CharField(min_length=8)
 
+    def validate(self, attrs):
+        validate_password_or_raise(attrs["new_password"], field_name="new_password")
+        return attrs
+
 
 class ResendOtpSerializer(serializers.Serializer):
     email = serializers.EmailField()
+    organization_slug = serializers.CharField(max_length=255, required=False)
     purpose = serializers.ChoiceField(
         choices=["verify", "reset"],
         default="verify",
@@ -669,11 +802,9 @@ class LoginSerializer(serializers.Serializer):
 
 # ── Whitelist serializers ──
 
-class WhitelistTeacherSerializer(serializers.Serializer):
+class OrganizationScopedWhitelistSerializer(serializers.Serializer):
     email = serializers.EmailField()
     organization_id = serializers.IntegerField(min_value=1, required=False)
-    grade = serializers.CharField(max_length=50, required=False, allow_blank=True)
-    section = serializers.CharField(max_length=50, required=False, allow_blank=True)
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -684,6 +815,25 @@ class WhitelistTeacherSerializer(serializers.Serializer):
         elif not attrs.get("organization_id"):
             raise serializers.ValidationError({"organization_id": "Organization is required."})
         return attrs
+
+
+class WhitelistSchoolAdminSerializer(OrganizationScopedWhitelistSerializer):
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated or not request.user.is_superuser:
+            raise serializers.ValidationError({"detail": "Only the platform super admin can whitelist school admin users."})
+        return attrs
+
+
+class WhitelistTeacherSerializer(OrganizationScopedWhitelistSerializer):
+    grade = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    section = serializers.CharField(max_length=50, required=False, allow_blank=True)
+
+
+class AdminWhitelistStudentSerializer(OrganizationScopedWhitelistSerializer):
+    grade = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    section = serializers.CharField(max_length=50, required=False, allow_blank=True)
 
 
 class WhitelistStudentSerializer(serializers.Serializer):

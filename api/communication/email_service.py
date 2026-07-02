@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
+def _mask_email(email: str) -> str:
+    local_part, _, domain = str(email or "").partition("@")
+    if not local_part or not domain:
+        return "***"
+    return f"{local_part[:1]}***@{domain}"
+
+
 def _render_template(template_name: str, context: dict[str, str]) -> str:
     path = _TEMPLATE_DIR / template_name
     if not path.exists():
@@ -55,10 +62,10 @@ def _send_email(to_email: str, subject: str, html_body: str) -> bool:
             if user and key:
                 server.login(user, key)
             server.sendmail(from_address, [to_email], message.as_string())
-        logger.info("Email sent to %s — subject: %s", to_email, subject)
+        logger.info("Email sent to %s — subject: %s", _mask_email(to_email), subject)
         return True
     except Exception:
-        logger.exception("Failed to send email to %s", to_email)
+        logger.exception("Failed to send email to %s", _mask_email(to_email))
         return False
 
 

@@ -3,17 +3,30 @@ from __future__ import annotations
 import re
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Avg, Count, Prefetch, Q
+from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date
 from django.utils import timezone
 from rest_framework import generics, serializers as drf_serializers, status
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 
+from api.auth_utils import (
+    authenticate_user_from_access_token,
+    build_auth_payload,
+    clear_auth_cookies,
+    get_access_token_from_request,
+    get_refresh_token_from_request,
+    get_user_from_refresh_token,
+    rotate_refresh_token,
+    set_auth_cookies,
+)
 from api.models import (
     AuditLog,
     Board,
@@ -41,6 +54,7 @@ from api.models import (
 )
 from api.permissions import IsAdminRole, IsProfessorRole, IsStudentRole, IsSuperAdminRole
 from api.serializers import (
+    AdminWhitelistStudentSerializer,
     AuditLogSerializer,
     AssignSubjectTeacherSerializer,
     AvailableTeacherSerializer,
@@ -75,6 +89,7 @@ from api.serializers import (
     TrackProgressSerializer,
     UserCreateUpdateSerializer,
     UserProfileSerializer,
+    WhitelistSchoolAdminSerializer,
     UserSerializer,
     WhitelistStudentSerializer,
     WhitelistTeacherSerializer,
@@ -84,6 +99,7 @@ from api.azure_clients import call_gpt_model
 from api.rag import search_index
 from api.syllabus_guard import build_syllabus_guardrail_for_lecture
 from api.tasks import generate_interactive_visualizer_code, launch_lecture_pipeline
+from api.throttles import LoginEmailRateThrottle, LoginIPRateThrottle
 
 
 UserModel = get_user_model()
@@ -108,6 +124,157 @@ def create_audit_log(
         target_user=target_user,
         metadata=metadata or {},
     )
+
+
+def normalize_email_address(email: str) -> str:
+    return UserModel.objects.normalize_email((email or "").strip())
+
+
+def resolve_whitelist_organization(*, request_user: User, organization_id: int) -> Organization | None:
+    if request_user.is_superuser:
+        return Organization.objects.filter(pk=organization_id).first()
+    if request_user.organization_id == organization_id:
+        return request_user.organization
+    return None
+
+
+def organization_subject_queryset(organization: Organization | None):
+    if organization is None:
+        return Subject.objects.none()
+    return Subject.objects.select_related("board", "grade").filter(
+        board__in=organization.boards.all(),
+        grade__in=organization.grades.all(),
+        is_active=True,
+    )
+
+
+def teacher_managed_classroom_queryset(user: User):
+    if user.organization_id is None:
+        return Classroom.objects.none()
+    return Classroom.objects.filter(
+        organization_id=user.organization_id,
+        is_active=True,
+    ).filter(
+        Q(professor=user) | Q(class_teacher=user)
+    ).distinct()
+
+
+def pending_whitelist_queryset(email: str):
+    return WhitelistedEmail.objects.select_related("organization", "created_by").filter(
+        email=email,
+        is_used=False,
+    )
+
+
+def resolve_existing_user_for_invite(email: str, organization_id: int, invite_role: str) -> tuple[User | None, Response | None]:
+    target_role = WhitelistedEmail.map_invite_role_to_user_role(invite_role)
+    existing_user = UserModel.objects.select_related("organization").filter(email=email).first()
+    if existing_user is None:
+        return None, None
+    if existing_user.is_superuser:
+        return None, Response(
+            {"detail": "This email already belongs to the platform super admin and cannot be invited."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if existing_user.organization_id != organization_id:
+        return None, Response(
+            {
+                "detail": "This email already belongs to another organization.",
+                "organization_id": existing_user.organization_id,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if existing_user.role != target_role:
+        return None, Response(
+            {
+                "detail": "This email already exists with a different role.",
+                "current_role": existing_user.role,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return existing_user, None
+
+
+def create_role_aware_whitelist(
+    *,
+    email: str,
+    invite_role: str,
+    created_by: User,
+    organization: Organization,
+    action: str,
+    grade: str | None = None,
+    section: str | None = None,
+    metadata: dict | None = None,
+    already_exists_message: str,
+    already_whitelisted_message: str,
+):
+    normalized_email = normalize_email_address(email)
+    existing_user, conflict_response = resolve_existing_user_for_invite(
+        normalized_email,
+        organization.id,
+        invite_role,
+    )
+    if conflict_response is not None:
+        return None, conflict_response
+
+    if existing_user and existing_user.is_active:
+        return None, Response(
+            {
+                "email": normalized_email,
+                "role": invite_role,
+                "status": "already_exists",
+                "user_id": existing_user.id,
+                "message": already_exists_message,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    existing_invite = pending_whitelist_queryset(normalized_email).filter(organization=organization).first()
+    if existing_invite:
+        response_status = status.HTTP_200_OK if existing_invite.role == invite_role else status.HTTP_400_BAD_REQUEST
+        message = (
+            already_whitelisted_message
+            if existing_invite.role == invite_role
+            else f"This email is already pending for {existing_invite.get_role_display().lower()} signup in this school."
+        )
+        return None, Response(
+            {
+                "id": existing_invite.id,
+                "email": existing_invite.email,
+                "role": existing_invite.role,
+                "status": "already_whitelisted",
+                "message": message,
+            },
+            status=response_status,
+        )
+
+    external_invite = pending_whitelist_queryset(normalized_email).exclude(organization=organization).first()
+    if external_invite:
+        return None, Response(
+            {
+                "detail": "This email already has a pending invitation for another organization.",
+                "organization_id": external_invite.organization_id,
+                "role": external_invite.role,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    entry = WhitelistedEmail.objects.create(
+        email=normalized_email,
+        role=invite_role,
+        created_by=created_by,
+        organization=organization,
+        grade=grade,
+        section=section,
+    )
+    create_audit_log(
+        action=action,
+        actor=created_by,
+        organization=organization,
+        target_email=entry.email,
+        metadata={"invite_role": invite_role, **(metadata or {})},
+    )
+    return entry, None
 
 
 def student_user_queryset():
@@ -255,22 +422,97 @@ def build_chat_response(lecture: Lecture, message: str):
 class CustomTokenObtainPairView(generics.GenericAPIView):
     permission_classes = [AllowAny]
     serializer_class = CustomTokenObtainPairSerializer
+    throttle_classes = [LoginIPRateThrottle, LoginEmailRateThrottle]
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        return Response(serializer.validated_data, status=status.HTTP_200_OK)
+        response_payload = {
+            "user": serializer.validated_data["user"],
+            "is_profile_complete": serializer.validated_data["is_profile_complete"],
+        }
+        response = Response(response_payload, status=status.HTTP_200_OK)
+        set_auth_cookies(
+            response,
+            access_token=serializer.validated_data["access_token"],
+            refresh_token=serializer.validated_data["refresh_token"],
+        )
+        return response
+
+
+class CookieTokenRefreshView(generics.GenericAPIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, *args, **kwargs):
+        raw_refresh_token = get_refresh_token_from_request(request)
+        if not raw_refresh_token:
+            response = Response({"detail": "Refresh token missing."}, status=status.HTTP_401_UNAUTHORIZED)
+            clear_auth_cookies(response)
+            return response
+
+        try:
+            user, access_token, refresh_token = rotate_refresh_token(raw_refresh_token)
+        except TokenError:
+            response = Response({"detail": "Invalid or expired refresh token."}, status=status.HTTP_401_UNAUTHORIZED)
+            clear_auth_cookies(response)
+            return response
+
+        response = Response(build_auth_payload(user), status=status.HTTP_200_OK)
+        set_auth_cookies(response, access_token=access_token, refresh_token=refresh_token)
+        return response
+
+
+class AuthSessionView(generics.GenericAPIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, *args, **kwargs):
+        raw_access_token = get_access_token_from_request(request)
+        if raw_access_token:
+            try:
+                user, _validated_token = authenticate_user_from_access_token(raw_access_token)
+                return Response(build_auth_payload(user), status=status.HTTP_200_OK)
+            except (AuthenticationFailed, TokenError):
+                pass
+
+        raw_refresh_token = get_refresh_token_from_request(request)
+        if not raw_refresh_token:
+            response = Response({"detail": "Authentication required."}, status=status.HTTP_401_UNAUTHORIZED)
+            clear_auth_cookies(response)
+            return response
+
+        try:
+            user, _refresh_token = get_user_from_refresh_token(raw_refresh_token)
+        except TokenError:
+            response = Response({"detail": "Authentication required."}, status=status.HTTP_401_UNAUTHORIZED)
+            clear_auth_cookies(response)
+            return response
+
+        return Response(build_auth_payload(user), status=status.HTTP_200_OK)
 
 
 class LogoutView(generics.GenericAPIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
     serializer_class = LogoutSerializer
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        token = RefreshToken(serializer.validated_data["refresh_token"])
-        token.blacklist()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        raw_refresh_token = get_refresh_token_from_request(request)
+        if raw_refresh_token:
+            try:
+                from rest_framework_simplejwt.tokens import RefreshToken
+
+                RefreshToken(raw_refresh_token).blacklist()
+            except TokenError:
+                response = Response({"detail": "Invalid or expired refresh token."}, status=status.HTTP_401_UNAUTHORIZED)
+                clear_auth_cookies(response)
+                return response
+        response = Response(status=status.HTTP_204_NO_CONTENT)
+        clear_auth_cookies(response)
+        return response
 
 
 class AdminOrganizationListCreateView(generics.ListCreateAPIView):
@@ -328,11 +570,15 @@ class AdminUserListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAdminRole]
 
     def get_queryset(self):
-        queryset = UserModel.objects.select_related("organization").all()
+        queryset = UserModel.objects.select_related("organization", "profile", "profile__mapped_teacher").all()
         if not self.request.user.is_superuser:
             if self.request.user.organization_id is None:
                 return UserModel.objects.none()
-            queryset = queryset.filter(organization_id=self.request.user.organization_id, is_superuser=False)
+            queryset = queryset.filter(
+                organization_id=self.request.user.organization_id,
+                is_superuser=False,
+                role__in=[User.Role.PROFESSOR, User.Role.STUDENT],
+            )
         role = self.request.query_params.get("role")
         org_id = self.request.query_params.get("org_id")
         if role:
@@ -357,17 +603,24 @@ class AdminUserListCreateView(generics.ListCreateAPIView):
             return UserCreateUpdateSerializer
         return UserSerializer
 
+    def create(self, request, *args, **kwargs):
+        raise drf_serializers.ValidationError({"detail": "Direct user creation is disabled. Use the whitelist invite flow instead."})
+
 
 class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAdminRole]
     lookup_url_kwarg = "user_id"
 
     def get_queryset(self):
-        queryset = UserModel.objects.select_related("organization").all()
+        queryset = UserModel.objects.select_related("organization", "profile", "profile__mapped_teacher").all()
         if self.request.user.is_superuser:
             return queryset
         if self.request.user.organization_id:
-            return queryset.filter(organization_id=self.request.user.organization_id, is_superuser=False)
+            return queryset.filter(
+                organization_id=self.request.user.organization_id,
+                is_superuser=False,
+                role__in=[User.Role.PROFESSOR, User.Role.STUDENT],
+            )
         return UserModel.objects.none()
 
     def get_serializer_class(self):
@@ -375,11 +628,32 @@ class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
             return UserCreateUpdateSerializer
         return UserSerializer
 
+    def perform_update(self, serializer):
+        user = serializer.save()
+        create_audit_log(
+            action="admin.update_user",
+            actor=self.request.user,
+            organization=user.organization,
+            target_user=user,
+            target_email=user.email,
+            metadata={"role": user.role},
+        )
+
     def perform_destroy(self, instance):
         if instance.is_superuser:
             raise drf_serializers.ValidationError({"detail": "Superuser accounts cannot be deactivated from this endpoint."})
+        if instance.pk == self.request.user.pk:
+            raise drf_serializers.ValidationError({"detail": "You cannot deactivate your own account from this endpoint."})
         instance.is_active = False
         instance.save(update_fields=["is_active", "updated_at"])
+        create_audit_log(
+            action="admin.deactivate_user",
+            actor=self.request.user,
+            organization=instance.organization,
+            target_user=instance,
+            target_email=instance.email,
+            metadata={"role": instance.role},
+        )
 
 
 class PlatformAnalyticsView(APIView):
@@ -480,18 +754,12 @@ class AdminOrganizationSubjectListView(generics.ListAPIView):
         if user.is_superuser:
             org_id = self.request.query_params.get("org_id")
             if org_id:
-                organization = Organization.objects.get(pk=org_id)
+                organization = Organization.objects.filter(pk=org_id).first()
             else:
                 return Subject.objects.none()
         else:
             organization = user.organization
-        if organization is None:
-            return Subject.objects.none()
-        return Subject.objects.select_related("board", "grade").filter(
-            board__in=organization.boards.all(),
-            grade__in=organization.grades.all(),
-            is_active=True,
-        )
+        return organization_subject_queryset(organization)
 
 
 class AdminSyllabusDocumentListCreateView(generics.ListCreateAPIView):
@@ -513,11 +781,7 @@ class AdminSyllabusDocumentListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         user = self.request.user
-        organization = user.organization
-        if user.is_superuser:
-            organization_id = self.request.data.get("organization")
-            if organization_id:
-                organization = Organization.objects.get(pk=organization_id)
+        organization = serializer.validated_data.get("organization") or user.organization
         if organization is None:
             raise drf_serializers.ValidationError({"organization": "Organization is required to upload syllabus files."})
 
@@ -568,13 +832,14 @@ class InteractiveVisualizerGenerateView(generics.GenericAPIView):
         lecture = None
         lecture_id = serializer.validated_data.get("lecture_id")
         if lecture_id:
-            lecture = Lecture.objects.select_related(
-                "classroom",
-                "classroom__organization",
-                "classroom__subject",
-                "classroom__subject__board",
-                "classroom__subject__grade",
-            ).get(
+            lecture = get_object_or_404(
+                Lecture.objects.select_related(
+                    "classroom",
+                    "classroom__organization",
+                    "classroom__subject",
+                    "classroom__subject__board",
+                    "classroom__subject__grade",
+                ),
                 pk=lecture_id,
                 classroom__organization=request.user.organization,
                 classroom__students=request.user,
@@ -666,7 +931,8 @@ class ProfessorClassroomEnrollView(generics.GenericAPIView):
     serializer_class = EnrollStudentsSerializer
 
     def post(self, request, *args, **kwargs):
-        classroom = classroom_base_queryset().get(
+        classroom = get_object_or_404(
+            classroom_base_queryset(),
             pk=kwargs["classroom_id"],
             professor=request.user,
             organization=request.user.organization,
@@ -716,7 +982,8 @@ class ProfessorClassroomLectureListCreateView(generics.ListCreateAPIView):
         return LectureListSerializer
 
     def perform_create(self, serializer):
-        classroom = Classroom.objects.select_related("organization").get(
+        classroom = get_object_or_404(
+            Classroom.objects.select_related("organization"),
             pk=self.kwargs["classroom_id"],
             professor=self.request.user,
             organization=self.request.user.organization,
@@ -749,7 +1016,8 @@ class ProfessorLectureTriggerPipelineView(APIView):
     permission_classes = [IsProfessorRole]
 
     def post(self, request, *args, **kwargs):
-        lecture = Lecture.objects.select_related("classroom", "classroom__organization").get(
+        lecture = get_object_or_404(
+            Lecture.objects.select_related("classroom", "classroom__organization"),
             pk=kwargs["lecture_id"],
             classroom__professor=request.user,
             classroom__organization=request.user.organization,
@@ -790,9 +1058,10 @@ class ProfessorLecturePipelineStatusView(APIView):
     permission_classes = [IsProfessorRole]
 
     def get(self, request, *args, **kwargs):
-        lecture = Lecture.objects.prefetch_related(
-            Prefetch("pipeline_runs", queryset=LecturePipelineRun.objects.order_by("-created_at"))
-        ).get(
+        lecture = get_object_or_404(
+            Lecture.objects.prefetch_related(
+                Prefetch("pipeline_runs", queryset=LecturePipelineRun.objects.order_by("-created_at"))
+            ),
             pk=kwargs["lecture_id"],
             classroom__professor=request.user,
             classroom__organization=request.user.organization,
@@ -837,7 +1106,8 @@ class ProfessorLectureQuizListCreateView(generics.ListCreateAPIView):
         return QuizSerializer
 
     def perform_create(self, serializer):
-        lecture = Lecture.objects.select_related("classroom").get(
+        lecture = get_object_or_404(
+            Lecture.objects.select_related("classroom"),
             pk=self.kwargs["lecture_id"],
             classroom__professor=self.request.user,
             classroom__organization=self.request.user.organization,
@@ -888,7 +1158,8 @@ class ProfessorQuizPublishView(APIView):
     permission_classes = [IsProfessorRole]
 
     def post(self, request, *args, **kwargs):
-        quiz = Quiz.objects.get(
+        quiz = get_object_or_404(
+            Quiz.objects.all(),
             pk=kwargs["quiz_id"],
             lecture__classroom__professor=request.user,
             lecture__classroom__organization=request.user.organization,
@@ -903,7 +1174,8 @@ class ProfessorClassroomAnalyticsView(APIView):
     permission_classes = [IsProfessorRole]
 
     def get(self, request, *args, **kwargs):
-        classroom = classroom_base_queryset().get(
+        classroom = get_object_or_404(
+            classroom_base_queryset(),
             pk=kwargs["classroom_id"],
             professor=request.user,
             organization=request.user.organization,
@@ -964,15 +1236,17 @@ class ProfessorLectureAnalyticsView(APIView):
     permission_classes = [IsProfessorRole]
 
     def get(self, request, *args, **kwargs):
-        lecture = Lecture.objects.filter(
+        lecture = get_object_or_404(
+            Lecture.objects.filter(
+                classroom__professor=request.user,
+                classroom__organization=request.user.organization,
+                is_active=True,
+            ).prefetch_related(
+                Prefetch("progress_records", queryset=LectureProgress.objects.filter(student__is_active=True)),
+                Prefetch("quizzes", queryset=Quiz.objects.filter(is_active=True).prefetch_related("attempts")),
+            ),
             pk=kwargs["lecture_id"],
-            classroom__professor=request.user,
-            classroom__organization=request.user.organization,
-            is_active=True,
-        ).prefetch_related(
-            Prefetch("progress_records", queryset=LectureProgress.objects.filter(student__is_active=True)),
-            Prefetch("quizzes", queryset=Quiz.objects.filter(is_active=True).prefetch_related("attempts")),
-        ).get()
+        )
 
         progress_records = list(lecture.progress_records.all())
         watch_percentages = [
@@ -1119,7 +1393,8 @@ class StudentLectureTranscriptView(APIView):
     permission_classes = [IsStudentRole]
 
     def get(self, request, *args, **kwargs):
-        lecture = Lecture.objects.select_related("classroom", "classroom__organization").prefetch_related("translations").get(
+        lecture = get_object_or_404(
+            Lecture.objects.select_related("classroom", "classroom__organization").prefetch_related("translations"),
             pk=kwargs["lecture_id"],
             classroom__students=request.user,
             classroom__organization=request.user.organization,
@@ -1159,7 +1434,8 @@ class StudentLectureProgressView(generics.GenericAPIView):
     serializer_class = TrackProgressSerializer
 
     def post(self, request, *args, **kwargs):
-        lecture = Lecture.objects.get(
+        lecture = get_object_or_404(
+            Lecture.objects.all(),
             pk=kwargs["lecture_id"],
             classroom__students=request.user,
             classroom__organization=request.user.organization,
@@ -1213,7 +1489,8 @@ class StudentQuizSubmitView(generics.GenericAPIView):
 
     @transaction.atomic
     def post(self, request, *args, **kwargs):
-        quiz = quiz_base_queryset(include_questions=True, published_only=True).get(
+        quiz = get_object_or_404(
+            quiz_base_queryset(include_questions=True, published_only=True),
             pk=kwargs["quiz_id"],
             classroom__students=request.user,
             classroom__organization=request.user.organization,
@@ -1296,14 +1573,15 @@ class StudentEnrollView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        classroom = Classroom.objects.select_related("professor", "organization").get(
+        classroom = get_object_or_404(
+            Classroom.objects.select_related("professor", "organization"),
             invite_code=serializer.validated_data["invite_code"],
             organization=request.user.organization,
             is_active=True,
         )
         ClassroomEnrollment.objects.get_or_create(user=request.user, classroom=classroom)
         serialized = ClassroomDetailSerializer(
-            classroom_base_queryset().get(pk=classroom.pk),
+            get_object_or_404(classroom_base_queryset(), pk=classroom.pk),
             context={"request": request},
         )
         return Response(serialized.data, status=status.HTTP_200_OK)
@@ -1314,7 +1592,8 @@ class StudentLectureChatView(generics.GenericAPIView):
     serializer_class = LectureChatSerializer
 
     def post(self, request, *args, **kwargs):
-        lecture = Lecture.objects.select_related("summary", "classroom").get(
+        lecture = get_object_or_404(
+            Lecture.objects.select_related("summary", "classroom"),
             pk=kwargs["lecture_id"],
             classroom__students=request.user,
             classroom__organization=request.user.organization,
@@ -1328,6 +1607,42 @@ class StudentLectureChatView(generics.GenericAPIView):
 
 # ── Whitelist endpoints ──
 
+class AdminWhitelistSchoolAdminView(generics.GenericAPIView):
+    permission_classes = [IsSuperAdminRole]
+    serializer_class = WhitelistSchoolAdminSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        organization = resolve_whitelist_organization(
+            request_user=request.user,
+            organization_id=serializer.validated_data["organization_id"],
+        )
+        if organization is None:
+            return Response(
+                {"organization_id": "Organization not found."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        entry, response = create_role_aware_whitelist(
+            email=serializer.validated_data["email"],
+            invite_role=WhitelistedEmail.InviteRole.SCHOOL_ADMIN,
+            created_by=request.user,
+            organization=organization,
+            action="admin.whitelist_school_admin",
+            already_exists_message="This school admin already has an active account for this school.",
+            already_whitelisted_message="This school admin email is already present in the onboarding list for this school.",
+        )
+        if response is not None:
+            return response
+
+        return Response(
+            {"id": entry.id, "email": entry.email, "role": entry.role, "status": "whitelisted"},
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class AdminWhitelistTeacherView(generics.GenericAPIView):
     permission_classes = [IsAdminRole]
     serializer_class = WhitelistTeacherSerializer
@@ -1335,59 +1650,80 @@ class AdminWhitelistTeacherView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        from api.models import WhitelistedEmail
-        email = UserModel.objects.normalize_email(serializer.validated_data["email"])
-        organization_id = serializer.validated_data["organization_id"]
-
-        existing_teacher = UserModel.objects.filter(
-            email=email,
-            organization_id=organization_id,
-            role=User.Role.PROFESSOR,
-            is_active=True,
-        ).first()
-        if existing_teacher:
+        organization = resolve_whitelist_organization(
+            request_user=request.user,
+            organization_id=serializer.validated_data["organization_id"],
+        )
+        if organization is None:
             return Response(
-                {
-                    "email": email,
-                    "status": "already_exists",
-                    "user_id": existing_teacher.id,
-                    "message": "This teacher already has an active account for this school.",
-                },
-                status=status.HTTP_200_OK,
+                {"organization_id": "Organization not found."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        existing_invite = WhitelistedEmail.objects.filter(
-            email=email,
-            organization_id=organization_id,
-        ).first()
-        if existing_invite:
-            return Response(
-                {
-                    "id": existing_invite.id,
-                    "email": existing_invite.email,
-                    "role": existing_invite.role,
-                    "status": "already_used" if existing_invite.is_used else "already_whitelisted",
-                    "message": "This teacher email is already present in the onboarding list for this school.",
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        entry = WhitelistedEmail.objects.create(
-            email=email,
-            role=WhitelistedEmail.InviteRole.TEACHER,
+        entry, response = create_role_aware_whitelist(
+            email=serializer.validated_data["email"],
+            invite_role=WhitelistedEmail.InviteRole.TEACHER,
             created_by=request.user,
-            organization_id=organization_id,
+            organization=organization,
+            action="admin.whitelist_teacher",
             grade=serializer.validated_data.get("grade"),
             section=serializer.validated_data.get("section"),
+            metadata={
+                "grade": serializer.validated_data.get("grade"),
+                "section": serializer.validated_data.get("section"),
+            },
+            already_exists_message="This teacher already has an active account for this school.",
+            already_whitelisted_message="This teacher email is already present in the onboarding list for this school.",
         )
-        create_audit_log(
-            action="admin.whitelist_teacher",
-            actor=request.user,
-            organization=entry.organization,
-            target_email=entry.email,
-            metadata={"grade": entry.grade, "section": entry.section},
+        if response is not None:
+            return response
+
+        return Response(
+            {"id": entry.id, "email": entry.email, "role": entry.role, "status": "whitelisted"},
+            status=status.HTTP_201_CREATED,
         )
-        return Response({"id": entry.id, "email": entry.email, "role": entry.role, "status": "whitelisted"}, status=status.HTTP_201_CREATED)
+
+
+class AdminWhitelistStudentView(generics.GenericAPIView):
+    permission_classes = [IsAdminRole]
+    serializer_class = AdminWhitelistStudentSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        organization = resolve_whitelist_organization(
+            request_user=request.user,
+            organization_id=serializer.validated_data["organization_id"],
+        )
+        if organization is None:
+            return Response(
+                {"organization_id": "Organization not found."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        entry, response = create_role_aware_whitelist(
+            email=serializer.validated_data["email"],
+            invite_role=WhitelistedEmail.InviteRole.STUDENT,
+            created_by=request.user,
+            organization=organization,
+            action="admin.whitelist_student",
+            grade=serializer.validated_data.get("grade"),
+            section=serializer.validated_data.get("section"),
+            metadata={
+                "grade": serializer.validated_data.get("grade"),
+                "section": serializer.validated_data.get("section"),
+            },
+            already_exists_message="This student already has an active account for this school.",
+            already_whitelisted_message="This student email is already present in the onboarding list for this school.",
+        )
+        if response is not None:
+            return response
+
+        return Response(
+            {"id": entry.id, "email": entry.email, "role": entry.role, "status": "whitelisted"},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class TeacherWhitelistStudentView(generics.GenericAPIView):
@@ -1398,21 +1734,52 @@ class TeacherWhitelistStudentView(generics.GenericAPIView):
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        email = serializer.validated_data["email"]
+        email = normalize_email_address(serializer.validated_data["email"])
         teacher = request.user
         profile = getattr(teacher, "profile", None)
         if profile is None:
             return Response({"detail": "Please complete your profile before whitelisting students."}, status=status.HTTP_400_BAD_REQUEST)
         org = teacher.organization
 
+        existing_student, conflict_response = resolve_existing_user_for_invite(
+            email,
+            org.id,
+            WhitelistedEmail.InviteRole.STUDENT,
+        )
+        if conflict_response is not None:
+            return conflict_response
+
+        pending_invite = pending_whitelist_queryset(email).filter(organization=org).first()
+        if pending_invite:
+            return Response(
+                {
+                    "id": pending_invite.id,
+                    "email": pending_invite.email,
+                    "role": pending_invite.role,
+                    "status": "already_whitelisted",
+                    "message": "This student email is already pending signup for this school.",
+                },
+                status=status.HTTP_200_OK if pending_invite.role == WhitelistedEmail.InviteRole.STUDENT else status.HTTP_400_BAD_REQUEST,
+            )
+
+        external_invite = pending_whitelist_queryset(email).exclude(organization=org).first()
+        if external_invite:
+            return Response(
+                {
+                    "detail": "This email already has a pending invitation for another organization.",
+                    "organization_id": external_invite.organization_id,
+                    "role": external_invite.role,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Check for returning student
-        existing_student = User.objects.filter(
-            email=email, organization=org, role=User.Role.STUDENT, is_active=True,
-        ).first()
-        if existing_student:
-            from api.models import WhitelistedEmail
+        if existing_student and existing_student.is_active:
             from api.communication.email_service import send_reassignment_notification
-            student_profile = existing_student.profile
+            student_profile, _ = UserProfile.objects.get_or_create(
+                user=existing_student,
+                defaults={"full_name": existing_student.name or ""},
+            )
             student_profile.grade = profile.grade
             student_profile.section = profile.section
             student_profile.mapped_teacher = teacher
@@ -1436,7 +1803,6 @@ class TeacherWhitelistStudentView(generics.GenericAPIView):
             )
             return Response({"status": "reassigned", "user_id": existing_student.id, "message": "Returning student reassigned to your class."})
 
-        from api.models import WhitelistedEmail
         entry = WhitelistedEmail.objects.create(
             email=email, role=WhitelistedEmail.InviteRole.STUDENT, created_by=teacher,
             organization=org, grade=profile.grade, section=profile.section,
@@ -1464,12 +1830,47 @@ class TeacherBulkWhitelistStudentView(generics.GenericAPIView):
         if profile is None:
             return Response({"detail": "Please complete your profile first."}, status=status.HTTP_400_BAD_REQUEST)
         org = teacher.organization
-        from api.models import WhitelistedEmail
         results = []
-        for email in serializer.validated_data["emails"]:
-            existing = User.objects.filter(email=email, organization=org, role=User.Role.STUDENT, is_active=True).first()
-            if existing:
-                sp = existing.profile
+        for raw_email in serializer.validated_data["emails"]:
+            email = normalize_email_address(raw_email)
+            existing, conflict_response = resolve_existing_user_for_invite(
+                email,
+                org.id,
+                WhitelistedEmail.InviteRole.STUDENT,
+            )
+            if conflict_response is not None:
+                detail = conflict_response.data if hasattr(conflict_response, "data") else {"detail": "Invitation conflict."}
+                results.append({"email": email, "status": "failed", **detail})
+                continue
+
+            pending_invite = pending_whitelist_queryset(email).filter(organization=org).first()
+            if pending_invite:
+                results.append({
+                    "email": email,
+                    "status": "already_whitelisted"
+                    if pending_invite.role == WhitelistedEmail.InviteRole.STUDENT
+                    else "failed",
+                    "id": pending_invite.id,
+                    "role": pending_invite.role,
+                })
+                continue
+
+            external_invite = pending_whitelist_queryset(email).exclude(organization=org).first()
+            if external_invite:
+                results.append({
+                    "email": email,
+                    "status": "failed",
+                    "detail": "This email already has a pending invitation for another organization.",
+                    "organization_id": external_invite.organization_id,
+                    "role": external_invite.role,
+                })
+                continue
+
+            if existing and existing.is_active:
+                sp, _ = UserProfile.objects.get_or_create(
+                    user=existing,
+                    defaults={"full_name": existing.name or ""},
+                )
                 sp.grade = profile.grade
                 sp.section = profile.section
                 sp.mapped_teacher = teacher
@@ -1512,21 +1913,13 @@ class TeacherAvailableSubjectsView(generics.ListAPIView):
         organization = self.request.user.organization
         if organization is None:
             return Subject.objects.none()
-        queryset = Subject.objects.select_related("board", "grade").filter(
-            is_active=True,
-            board__in=organization.boards.all(),
-            grade__in=organization.grades.all(),
-        )
+        queryset = organization_subject_queryset(organization)
         classroom_id = self.request.query_params.get("classroom_id")
         if classroom_id:
-            classroom = Classroom.objects.filter(
-                pk=classroom_id,
-                organization=organization,
-                is_active=True,
-            ).first()
+            classroom = teacher_managed_classroom_queryset(self.request.user).filter(pk=classroom_id).first()
             if classroom is None:
                 return Subject.objects.none()
-            queryset = queryset.filter(grade=classroom.subject.grade)
+            queryset = queryset.filter(board=classroom.subject.board, grade=classroom.subject.grade)
         return queryset.order_by("board__name", "grade__numeric_value", "name")
 
 
@@ -1543,14 +1936,8 @@ class TeacherAvailableTeachersView(generics.ListAPIView):
         )
         classroom_id = self.request.query_params.get("classroom_id")
         if classroom_id:
-            classroom = Classroom.objects.filter(
-                pk=classroom_id,
-                organization=organization,
-                is_active=True,
-            ).first()
+            classroom = teacher_managed_classroom_queryset(self.request.user).filter(pk=classroom_id).first()
             if classroom is None:
-                return User.objects.none()
-            if classroom.class_teacher and classroom.class_teacher != self.request.user:
                 return User.objects.none()
             queryset = queryset.exclude(pk=classroom.professor_id)
         return queryset.order_by("name", "email")
@@ -1617,6 +2004,15 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
             user.is_profile_complete = True
             user.save(update_fields=["is_profile_complete", "updated_at"])
 
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        refreshed_serializer = self.get_serializer(instance)
+        return Response(refreshed_serializer.data)
+
 
 # ── Classroom orchestration endpoints ──
 
@@ -1627,7 +2023,7 @@ class ClassroomSubjectTeacherListView(generics.ListCreateAPIView):
         from api.models import ClassroomSubjectTeacher
         return ClassroomSubjectTeacher.objects.select_related("teacher", "subject", "subject__board", "subject__grade").filter(
             classroom_id=self.kwargs["classroom_id"],
-            classroom__organization=self.request.user.organization,
+            classroom__in=teacher_managed_classroom_queryset(self.request.user),
         )
 
     def get_serializer_class(self):
@@ -1635,20 +2031,37 @@ class ClassroomSubjectTeacherListView(generics.ListCreateAPIView):
             return AssignSubjectTeacherSerializer
         return ClassroomSubjectTeacherSerializer
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        assignment = self.perform_create(serializer)
+        output = ClassroomSubjectTeacherSerializer(assignment, context=self.get_serializer_context())
+        return Response(output.data, status=status.HTTP_201_CREATED)
+
     def perform_create(self, serializer):
         from api.models import Classroom, ClassroomSubjectTeacher, Subject, User
-        classroom = Classroom.objects.get(
-            pk=self.kwargs["classroom_id"], organization=self.request.user.organization,
+        classroom = get_object_or_404(
+            teacher_managed_classroom_queryset(self.request.user).select_related("organization", "subject", "subject__board", "subject__grade"),
+            pk=self.kwargs["classroom_id"],
         )
-        if classroom.class_teacher and classroom.class_teacher != self.request.user:
-            raise drf_serializers.ValidationError({"detail": "Only the class teacher can assign subject teachers."})
-        teacher = User.objects.get(
+        teacher = get_object_or_404(
+            User.objects.filter(
+                organization=self.request.user.organization,
+                role=User.Role.PROFESSOR,
+                is_active=True,
+            ),
             pk=serializer.validated_data["teacher_id"],
-            organization=self.request.user.organization,
-            role=User.Role.PROFESSOR,
         )
-        subject = Subject.objects.get(pk=serializer.validated_data["subject_id"], is_active=True)
-        assignment = ClassroomSubjectTeacher.objects.create(classroom=classroom, teacher=teacher, subject=subject)
+        subject = get_object_or_404(
+            organization_subject_queryset(classroom.organization),
+            pk=serializer.validated_data["subject_id"],
+        )
+        assignment = ClassroomSubjectTeacher(classroom=classroom, teacher=teacher, subject=subject)
+        try:
+            assignment.full_clean()
+        except DjangoValidationError as exc:
+            raise drf_serializers.ValidationError(exc.message_dict) from exc
+        assignment.save()
         create_audit_log(
             action="teacher.assign_subject_teacher",
             actor=self.request.user,
@@ -1663,6 +2076,7 @@ class ClassroomSubjectTeacherListView(generics.ListCreateAPIView):
                 "assignment_id": assignment.id,
             },
         )
+        return assignment
 
 
 class ClassroomSubjectTeacherRemoveView(generics.DestroyAPIView):
@@ -1673,13 +2087,11 @@ class ClassroomSubjectTeacherRemoveView(generics.DestroyAPIView):
         from api.models import ClassroomSubjectTeacher
         return ClassroomSubjectTeacher.objects.filter(
             classroom_id=self.kwargs["classroom_id"],
-            classroom__organization=self.request.user.organization,
+            classroom__in=teacher_managed_classroom_queryset(self.request.user),
         )
 
     def perform_destroy(self, instance):
         classroom = instance.classroom
-        if classroom.class_teacher and classroom.class_teacher != self.request.user:
-            raise drf_serializers.ValidationError({"detail": "Only the class teacher can remove subject teachers."})
         create_audit_log(
             action="teacher.remove_subject_teacher",
             actor=self.request.user,

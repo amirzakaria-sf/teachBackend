@@ -1,13 +1,13 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from api import auth_views, views
 
 
 urlpatterns = [
     path("auth/login/", views.CustomTokenObtainPairView.as_view(), name="auth-login"),
-    path("auth/token/refresh/", TokenRefreshView.as_view(), name="auth-token-refresh"),
+    path("auth/token/refresh/", views.CookieTokenRefreshView.as_view(), name="auth-token-refresh"),
     path("auth/logout/", views.LogoutView.as_view(), name="auth-logout"),
+    path("auth/session/", views.AuthSessionView.as_view(), name="auth-session"),
 
     # ── Auth flow (signup, forgot/reset password) ──
     path("auth/request-otp/", auth_views.RequestOtpView.as_view(), name="auth-request-otp"),
@@ -21,7 +21,9 @@ urlpatterns = [
     path("users/profile/", views.UserProfileView.as_view(), name="user-profile"),
 
     # ── Admin ──
+    path("admin/whitelist-school-admin/", views.AdminWhitelistSchoolAdminView.as_view(), name="admin-whitelist-school-admin"),
     path("admin/whitelist-teacher/", views.AdminWhitelistTeacherView.as_view(), name="admin-whitelist-teacher"),
+    path("admin/whitelist-student/", views.AdminWhitelistStudentView.as_view(), name="admin-whitelist-student"),
     path("admin/organizations/", views.AdminOrganizationListCreateView.as_view(), name="admin-organizations"),
     path("admin/organizations/<int:org_id>/", views.AdminOrganizationDetailView.as_view(), name="admin-organization-detail"),
     path("admin/organizations/subjects/", views.AdminOrganizationSubjectListView.as_view(), name="admin-organization-subjects"),

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone as dt_timezone
 from urllib.parse import urlparse
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management.base import BaseCommand, CommandError
@@ -335,10 +336,14 @@ class Command(BaseCommand):
         if otp is None:
             raise CommandError(f"OTP was not generated for {email}")
 
+        verify_code = str(getattr(settings, "FIXED_TEST_OTP", "") or "").strip()
+        if len(verify_code) != 6 or not verify_code.isdigit():
+            raise CommandError("FIXED_TEST_OTP must be configured to run the E2E signup flow securely.")
+
         verify = self._post(
             client,
             "/api/auth/verify-otp/",
-            {"email": email, "otp_code": otp.otp_code},
+            {"email": email, "otp_code": verify_code},
             expected=200,
         )
         setup_token = verify["setup_token"]
@@ -381,8 +386,11 @@ class Command(BaseCommand):
         client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
 
     def _login(self, client: APIClient, *, email: str, password: str) -> Actor:
-        payload = self._post(client, "/api/auth/login/", {"email": email, "password": password}, expected=200)
-        return Actor(email=email, password=password, token=payload["access_token"])
+        self._post(client, "/api/auth/login/", {"email": email, "password": password}, expected=200)
+        access_cookie = client.cookies.get(settings.AUTH_ACCESS_COOKIE_NAME)
+        if access_cookie is None or not access_cookie.value:
+            raise CommandError("Login did not issue an access token cookie.")
+        return Actor(email=email, password=password, token=access_cookie.value)
 
     def _get(self, client: APIClient, path: str):
         response = client.get(path)
