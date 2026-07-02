@@ -42,6 +42,27 @@ def csrf_origins_from_hosts(hosts: list[str]) -> list[str]:
         origins.append(f'https://{normalized_host}')
     return origins
 
+
+def validate_drf_rate(name: str, value: str) -> str:
+    raw_value = str(value or '').strip()
+    if not raw_value:
+        raise ImproperlyConfigured(f"REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['{name}'] must not be empty.")
+
+    try:
+        request_count, period = raw_value.split('/', 1)
+        int(request_count.strip())
+    except (TypeError, ValueError) as exc:
+        raise ImproperlyConfigured(
+            f"Invalid DRF throttle rate for '{name}': {raw_value!r}. Expected '<count>/<period>' such as '10/m'."
+        ) from exc
+
+    normalized_period = period.strip().lower()
+    if not normalized_period or normalized_period[0] not in {'s', 'm', 'h', 'd'}:
+        raise ImproperlyConfigured(
+            f"Invalid DRF throttle rate for '{name}': {raw_value!r}. Supported periods must begin with s, m, h, or d."
+        )
+    return raw_value
+
 DEBUG = env_bool('DEBUG', False)
 
 SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
@@ -243,18 +264,21 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ),
     'DEFAULT_THROTTLE_RATES': {
-        'login_ip': '10/min',
-        'login_email': '5/10min',
-        'otp_request_ip': '10/min',
-        'otp_request_email': '5/10min',
-        'otp_verify_ip': '20/10min',
-        'otp_verify_email': '5/10min',
-        'password_reset_request_ip': '10/min',
-        'password_reset_request_email': '5/10min',
-        'password_reset_confirm_ip': '10/min',
-        'password_reset_confirm_email': '5/10min',
+        'login_ip': '10/m',
+        'login_email': '5/m',
+        'otp_request_ip': '10/m',
+        'otp_request_email': '5/m',
+        'otp_verify_ip': '20/m',
+        'otp_verify_email': '5/m',
+        'password_reset_request_ip': '10/m',
+        'password_reset_request_email': '5/m',
+        'password_reset_confirm_ip': '10/m',
+        'password_reset_confirm_email': '5/m',
     },
 }
+
+for throttle_name, throttle_rate in REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'].items():
+    validate_drf_rate(throttle_name, throttle_rate)
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
